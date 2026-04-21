@@ -1,17 +1,40 @@
 # Serpico to PlexTrac Converter
 
-Offline Python converter for turning Serpico backup/export data into a PlexTrac
-Report Findings CSV.
+Offline Python converter for migrating a Serpico backup/export that contains
+many penetration testing reports into PlexTrac Report Findings CSV files.
 
-The script targets PlexTrac's Report Findings CSV import headers:
+The important bit: this does **not** flatten everything into one blob by
+default. It writes separate CSV files and a manifest so findings remain grouped
+by report and owning team.
+
+## Output
+
+By default, the converter creates:
+
+```text
+plextrac_exports/
+  manifest.csv
+  0001_<team> - <report>.csv
+  0002_<team> - <report>.csv
+  ...
+```
+
+Each numbered CSV is meant to be imported into the corresponding PlexTrac report.
+`manifest.csv` is your migration map. It shows the grouping key, output file,
+finding count, original Serpico report/client/owner/team values, and source
+backup file.
+
+The PlexTrac columns are:
 
 ```text
 title,severity,status,description,recommendations,references,affected_assets,tags,cvss_temporal,cwe,cve,category
 ```
 
-It also appends a few custom columns (`serpico_id`, `serpico_source`,
-`serpico_path`, `serpico_report`) so you can trace each imported finding back to
-the original Serpico document.
+The script appends traceability columns:
+
+```text
+serpico_id,serpico_source,serpico_path,serpico_report,serpico_client,serpico_owner,serpico_team
+```
 
 ## What it reads
 
@@ -20,54 +43,89 @@ the original Serpico document.
 - `.zip`, `.tar`, `.tar.gz`, and `.tgz` archives containing those files
 - `.bson` MongoDB dumps when `pymongo` is installed
 
-Serpico installations vary, so the converter uses conservative field heuristics
-instead of assuming one exact backup shape. It looks for finding-like objects and
-maps common Serpico-style fields such as `title`, `name`, `overview`,
-`description`, `risk`, `severity`, `remediation`, `references`, `hosts`, and
-`affected_hosts`.
+Serpico installations vary, so the converter uses conservative field heuristics.
+Nested findings inherit context from parent report objects, including report,
+client, owner, and team fields when those values exist in the backup.
 
 ## Quick start
 
+Windows:
+
 ```powershell
-python serpico_to_plextrac.py C:\path\to\serpico_backup -o plextrac_findings.csv --tag Serpico
+python serpico_to_plextrac.py C:\path\to\serpico_backup --tag Serpico
 ```
 
-For Linux/macOS:
+Linux/macOS:
 
 ```bash
-python3 serpico_to_plextrac.py /path/to/serpico_backup -o plextrac_findings.csv --tag Serpico
+python3 serpico_to_plextrac.py /path/to/serpico_backup --tag Serpico
 ```
 
 If your backup contains BSON files:
 
 ```bash
 python3 -m pip install pymongo
-python3 serpico_to_plextrac.py /path/to/mongodump -o plextrac_findings.csv --tag Serpico
+python3 serpico_to_plextrac.py /path/to/mongodump --tag Serpico
 ```
 
-## Recommended first run
+## Split options
 
-Run with diagnostics, then inspect the JSON before importing to PlexTrac:
+Default:
+
+```bash
+python3 serpico_to_plextrac.py ./serpico_backup --split-by report-owner
+```
+
+Available split modes:
+
+```text
+report-owner   one CSV per owning team/report combination
+report         one CSV per Serpico report
+team           one CSV per owning team
+owner          one CSV per owner
+client         one CSV per client/customer
+none           one CSV named all-findings.csv in the output directory
+field:<header> one CSV per value in any output CSV header
+```
+
+Examples:
+
+```bash
+python3 serpico_to_plextrac.py ./serpico_backup --split-by team --output-dir plextrac_by_team
+python3 serpico_to_plextrac.py ./serpico_backup --split-by client --output-dir plextrac_by_client
+python3 serpico_to_plextrac.py ./serpico_backup --split-by field:category
+```
+
+To force a legacy single CSV:
+
+```bash
+python3 serpico_to_plextrac.py ./serpico_backup -o plextrac_findings_combined.csv
+```
+
+## Recommended migration run
 
 ```bash
 python3 serpico_to_plextrac.py ./serpico_backup \
-  --output plextrac_findings.csv \
+  --output-dir plextrac_exports \
   --diagnostics conversion_diagnostics.json \
+  --split-by report-owner \
   --tag Serpico
 ```
 
-The diagnostics file reports:
+Then review:
 
-- how many documents were loaded
-- how many looked like findings
-- rows skipped or written with missing required values
-- unsupported file types or parse warnings
+- `plextrac_exports/manifest.csv`
+- `conversion_diagnostics.json`
+- a few representative generated CSVs before importing into PlexTrac
 
 ## Useful options
 
 ```text
 --strict
   Skip rows missing PlexTrac-required title or description.
+
+--require-group
+  Skip findings that do not have the selected split context.
 
 --collection-pattern "findings|reports"
   Only inspect source filenames matching this regex.
@@ -81,13 +139,15 @@ The diagnostics file reports:
 
 ## Importing into PlexTrac
 
-In PlexTrac, import the generated CSV into a report through Findings -> Add
-Findings -> File Imports, and select `CSV` as the source. PlexTrac requires
-`title`, `severity`, and `description`; this script always writes the required
-headers and normalizes severity to `Informational`, `Low`, `Medium`, `High`, or
-`Critical`.
+In PlexTrac, create or open the appropriate report, then import that report's
+CSV through Findings -> Add Findings -> File Imports and select `CSV` as the
+source.
+
+PlexTrac requires `title`, `severity`, and `description`. The converter always
+writes the required headers and normalizes severity to `Informational`, `Low`,
+`Medium`, `High`, or `Critical`.
 
 ## Notes
 
 The converter does not modify the Serpico backup. It only reads backup files and
-writes a new CSV plus diagnostics.
+writes PlexTrac CSVs plus diagnostics.

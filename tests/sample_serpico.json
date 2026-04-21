@@ -1,21 +1,39 @@
-[
-  {
-    "_id": "abc123",
-    "title": "TLS Certificate Expired",
-    "risk": "High",
-    "overview": "The service presented an expired certificate. Related: CVE-2024-12345.",
-    "remediation": "Replace the certificate and automate renewal.",
-    "references": ["https://example.test/tls", "CWE-295"],
-    "affected_hosts": ["app01.example.test", "10.0.0.5"],
-    "category": "Transport Security"
-  },
-  {
-    "_id": "def456",
-    "name": "Missing Security Headers",
-    "severity": "4.3",
-    "description": "<p>Several HTTP security headers were absent.</p>",
-    "solution": "Set the required response headers.",
-    "url": "https://app.example.test",
-    "tags": ["web"]
-  }
-]
+{
+  "reports": [
+    {
+      "_id": "report-001",
+      "report_title": "External Penetration Test",
+      "client_name": "Example Corp",
+      "owning_team": "Network Security",
+      "findings": [
+        {
+          "_id": "abc123",
+          "title": "TLS Certificate Expired",
+          "risk": "High",
+          "overview": "The service presented an expired certificate. Related: CVE-2024-12345.",
+          "remediation": "Replace the certificate and automate renewal.",
+          "references": ["https://example.test/tls", "CWE-295"],
+          "affected_hosts": ["app01.example.test", "10.0.0.5"],
+          "category": "Transport Security"
+        }
+      ]
+    },
+    {
+      "_id": "report-002",
+      "report_title": "Application Penetration Test",
+      "client_name": "Example Corp",
+      "owning_team": "Application Security",
+      "findings": [
+        {
+          "_id": "def456",
+          "name": "Missing Security Headers",
+          "severity": "4.3",
+          "description": "<p>Several HTTP security headers were absent.</p>",
+          "solution": "Set the required response headers.",
+          "url": "https://app.example.test",
+          "tags": ["web"]
+        }
+      ]
+    }
+  ]
+}

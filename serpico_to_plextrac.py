@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert Serpico backup/export data into a PlexTrac findings CSV.
+"""Convert Serpico backup/export data into PlexTrac findings CSV files.
 
 The converter is intentionally dependency-light. It handles JSON, JSONL, ZIP,
 and tar archives with the Python standard library. MongoDB BSON dumps are also
@@ -11,12 +11,9 @@ from __future__ import annotations
 import argparse
 import csv
 import html
-import io
 import json
 import re
-import sys
 import tarfile
-import tempfile
 import zipfile
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
@@ -44,6 +41,9 @@ CUSTOM_HEADERS = [
     "serpico_source",
     "serpico_path",
     "serpico_report",
+    "serpico_client",
+    "serpico_owner",
+    "serpico_team",
 ]
 
 SEVERITIES = {
@@ -102,7 +102,34 @@ FIELD_CANDIDATES = {
     "cwe": ("cwe", "cwes"),
     "cve": ("cve", "cves"),
     "category": ("category", "type", "finding_type", "classification"),
-    "serpico_report": ("report", "report_name", "report_title", "project", "project_name"),
+    "serpico_report": (
+        "report",
+        "report_name",
+        "report_title",
+        "project",
+        "project_name",
+        "assessment",
+        "assessment_name",
+    ),
+    "serpico_client": ("client", "client_name", "customer", "customer_name", "company"),
+    "serpico_owner": (
+        "owner",
+        "owner_name",
+        "report_owner",
+        "created_by",
+        "creator",
+        "author",
+        "user",
+    ),
+    "serpico_team": (
+        "team",
+        "team_name",
+        "owner_team",
+        "owning_team",
+        "business_unit",
+        "department",
+        "practice",
+    ),
 }
 
 HTML_TAG_RE = re.compile(r"<[^>]+>")
@@ -115,6 +142,7 @@ class SourceRecord:
     source: str
     path: str
     data: dict[str, Any]
+    context: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -122,6 +150,7 @@ class Diagnostics:
     loaded_documents: int = 0
     candidate_documents: int = 0
     written_findings: int = 0
+    written_files: int = 0
     skipped: list[dict[str, str]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
@@ -191,6 +220,13 @@ def first_value(document: dict[str, Any], names: Iterable[str]) -> Any:
     return None
 
 
+def first_contextual_value(document: dict[str, Any], context: dict[str, str], name: str) -> str:
+    value = clean_text(first_value(document, FIELD_CANDIDATES[name]))
+    if value:
+        return value
+    return context.get(name, "")
+
+
 def normalize_severity(raw: Any, default: str = "Informational") -> str:
     text = clean_text(raw).lower()
     if not text:
@@ -245,6 +281,15 @@ def record_id(document: dict[str, Any]) -> str:
     return ""
 
 
+def extract_context(document: dict[str, Any], parent_context: dict[str, str]) -> dict[str, str]:
+    context = dict(parent_context)
+    for name in ("serpico_report", "serpico_client", "serpico_owner", "serpico_team"):
+        value = clean_text(first_value(document, FIELD_CANDIDATES[name]))
+        if value:
+            context[name] = value
+    return context
+
+
 def map_record(record: SourceRecord, default_status: str, tags: list[str]) -> tuple[dict[str, str], list[str]]:
     doc = record.data
     title = clean_text(first_value(doc, FIELD_CANDIDATES["title"]))
@@ -271,7 +316,10 @@ def map_record(record: SourceRecord, default_status: str, tags: list[str]) -> tu
         "serpico_id": record_id(doc),
         "serpico_source": record.source,
         "serpico_path": record.path,
-        "serpico_report": clean_text(first_value(doc, FIELD_CANDIDATES["serpico_report"])),
+        "serpico_report": first_contextual_value(doc, record.context, "serpico_report"),
+        "serpico_client": first_contextual_value(doc, record.context, "serpico_client"),
+        "serpico_owner": first_contextual_value(doc, record.context, "serpico_owner"),
+        "serpico_team": first_contextual_value(doc, record.context, "serpico_team"),
     }
 
     missing = [name for name in ("title", "description") if not row[name]]
@@ -294,14 +342,21 @@ def looks_like_finding(path: str, document: dict[str, Any]) -> bool:
     return bool(has_title and (has_body or path_hint))
 
 
-def walk_documents(value: Any, source: str, path: str = "$") -> Iterator[SourceRecord]:
+def walk_documents(
+    value: Any,
+    source: str,
+    path: str = "$",
+    context: dict[str, str] | None = None,
+) -> Iterator[SourceRecord]:
+    context = context or {}
     if isinstance(value, dict):
-        yield SourceRecord(source=source, path=path, data=value)
+        next_context = extract_context(value, context)
+        yield SourceRecord(source=source, path=path, data=value, context=next_context)
         for key, item in value.items():
-            yield from walk_documents(item, source, f"{path}.{key}")
+            yield from walk_documents(item, source, f"{path}.{key}", next_context)
     elif isinstance(value, list):
         for index, item in enumerate(value):
-            yield from walk_documents(item, source, f"{path}[{index}]")
+            yield from walk_documents(item, source, f"{path}[{index}]", context)
 
 
 def parse_json_bytes(content: bytes, source: str) -> Iterator[SourceRecord]:
@@ -384,8 +439,7 @@ def records_from_bytes(content: bytes, source: str, diagnostics: Diagnostics) ->
         diagnostics.warnings.append(f"Could not parse {source}: {exc}")
 
 
-def convert(args: argparse.Namespace) -> Diagnostics:
-    diagnostics = Diagnostics()
+def collect_rows(args: argparse.Namespace, diagnostics: Diagnostics) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     seen: set[tuple[str, str, str]] = set()
     collection_re = re.compile(args.collection_pattern, re.IGNORECASE) if args.collection_pattern else None
@@ -398,6 +452,15 @@ def convert(args: argparse.Namespace) -> Diagnostics:
             continue
         diagnostics.candidate_documents += 1
         row, missing = map_record(record, args.status, args.tag)
+        if args.require_group and not has_required_split_context(row, args.split_by):
+            diagnostics.skipped.append(
+                {
+                    "source": record.source,
+                    "path": record.path,
+                    "reason": f"missing required split context: {args.split_by}",
+                }
+            )
+            continue
         key = (row["serpico_source"], row["serpico_id"], row["title"])
         if key in seen:
             continue
@@ -415,13 +478,123 @@ def convert(args: argparse.Namespace) -> Diagnostics:
                 continue
         rows.append(row)
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with args.output.open("w", newline="", encoding="utf-8-sig") as handle:
+    return rows
+
+
+def group_key_for_row(row: dict[str, str], split_by: str) -> str:
+    if split_by == "none":
+        return "all-findings"
+    if split_by == "report":
+        return row.get("serpico_report") or row.get("serpico_source") or "unknown-report"
+    if split_by == "team":
+        return row.get("serpico_team") or "unknown-team"
+    if split_by == "owner":
+        return row.get("serpico_owner") or "unknown-owner"
+    if split_by == "client":
+        return row.get("serpico_client") or "unknown-client"
+    if split_by == "report-owner":
+        report = row.get("serpico_report") or "unknown-report"
+        owner = row.get("serpico_team") or row.get("serpico_owner") or "unknown-owner"
+        return f"{owner} - {report}"
+    if split_by.startswith("field:"):
+        field_name = split_by.split(":", 1)[1]
+        return row.get(field_name) or f"unknown-{field_name}"
+    raise ValueError(f"Unsupported split mode: {split_by}")
+
+
+def has_required_split_context(row: dict[str, str], split_by: str) -> bool:
+    if split_by == "none":
+        return True
+    if split_by == "report":
+        return bool(row.get("serpico_report"))
+    if split_by == "team":
+        return bool(row.get("serpico_team"))
+    if split_by == "owner":
+        return bool(row.get("serpico_owner"))
+    if split_by == "client":
+        return bool(row.get("serpico_client"))
+    if split_by == "report-owner":
+        return bool(row.get("serpico_report") and (row.get("serpico_team") or row.get("serpico_owner")))
+    if split_by.startswith("field:"):
+        field_name = split_by.split(":", 1)[1]
+        return bool(row.get(field_name))
+    raise ValueError(f"Unsupported split mode: {split_by}")
+
+
+def safe_filename(value: str, fallback: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._ -]+", "_", value).strip(" ._-")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    if not cleaned:
+        cleaned = fallback
+    return cleaned[:120]
+
+
+def write_csv(path: Path, rows: list[dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(handle, fieldnames=[*PLEXTRAC_HEADERS, *CUSTOM_HEADERS])
         writer.writeheader()
         writer.writerows(rows)
 
+
+def write_manifest(path: Path, groups: dict[str, list[dict[str, str]]], filenames: dict[str, str]) -> None:
+    fieldnames = [
+        "group",
+        "file",
+        "finding_count",
+        "reports",
+        "clients",
+        "owners",
+        "teams",
+        "sources",
+    ]
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for group in sorted(groups):
+            rows = groups[group]
+            writer.writerow(
+                {
+                    "group": group,
+                    "file": filenames[group],
+                    "finding_count": len(rows),
+                    "reports": csv_multi(row.get("serpico_report", "") for row in rows),
+                    "clients": csv_multi(row.get("serpico_client", "") for row in rows),
+                    "owners": csv_multi(row.get("serpico_owner", "") for row in rows),
+                    "teams": csv_multi(row.get("serpico_team", "") for row in rows),
+                    "sources": csv_multi(row.get("serpico_source", "") for row in rows),
+                }
+            )
+
+
+def convert(args: argparse.Namespace) -> Diagnostics:
+    diagnostics = Diagnostics()
+    rows = collect_rows(args, diagnostics)
     diagnostics.written_findings = len(rows)
+
+    if args.output:
+        write_csv(args.output, rows)
+        diagnostics.written_files = 1
+    else:
+        groups: dict[str, list[dict[str, str]]] = {}
+        for row in rows:
+            groups.setdefault(group_key_for_row(row, args.split_by), []).append(row)
+
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        filenames: dict[str, str] = {}
+        used_filenames: set[str] = set()
+        for index, group in enumerate(sorted(groups), start=1):
+            base = safe_filename(group, f"group-{index:04d}")
+            filename = "all-findings.csv" if args.split_by == "none" else f"{index:04d}_{base}.csv"
+            while filename.lower() in used_filenames:
+                filename = f"{index:04d}_{base}_{len(used_filenames)}.csv"
+            used_filenames.add(filename.lower())
+            filenames[group] = filename
+            write_csv(args.output_dir / filename, groups[group])
+
+        write_manifest(args.output_dir / "manifest.csv", groups, filenames)
+        diagnostics.written_files = len(groups)
+
     if args.diagnostics:
         args.diagnostics.parent.mkdir(parents=True, exist_ok=True)
         args.diagnostics.write_text(
@@ -433,15 +606,28 @@ def convert(args: argparse.Namespace) -> Diagnostics:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Convert Serpico backup/export data to PlexTrac report findings CSV."
+        description="Convert Serpico backup/export data to PlexTrac report findings CSV files."
     )
     parser.add_argument("input", type=Path, help="Serpico backup file, archive, or directory.")
     parser.add_argument(
         "-o",
         "--output",
         type=Path,
-        default=Path("plextrac_findings.csv"),
-        help="Output PlexTrac CSV path. Default: plextrac_findings.csv",
+        help="Write one combined PlexTrac CSV. Omit this to split into multiple CSVs.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("plextrac_exports"),
+        help="Directory for split CSV output and manifest. Default: plextrac_exports",
+    )
+    parser.add_argument(
+        "--split-by",
+        default="report-owner",
+        help=(
+            "How to separate output CSV files: report-owner, report, team, owner, "
+            "client, none, or field:<csv_header>. Default: report-owner"
+        ),
     )
     parser.add_argument(
         "--diagnostics",
@@ -470,6 +656,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip rows missing PlexTrac-required title or description.",
     )
+    parser.add_argument(
+        "--require-group",
+        action="store_true",
+        help="Skip candidate findings that do not have the selected split context.",
+    )
     return parser
 
 
@@ -481,11 +672,16 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Loaded documents: {diagnostics.loaded_documents}")
     print(f"Candidate findings: {diagnostics.candidate_documents}")
     print(f"Wrote findings: {diagnostics.written_findings}")
+    print(f"Wrote CSV files: {diagnostics.written_files}")
     if diagnostics.skipped:
-        print(f"Rows with missing required fields: {len(diagnostics.skipped)}")
+        print(f"Skipped or incomplete rows: {len(diagnostics.skipped)}")
     if diagnostics.warnings:
         print(f"Warnings: {len(diagnostics.warnings)}")
-    print(f"CSV: {args.output}")
+    if args.output:
+        print(f"CSV: {args.output}")
+    else:
+        print(f"Output directory: {args.output_dir}")
+        print(f"Manifest: {args.output_dir / 'manifest.csv'}")
     if args.diagnostics:
         print(f"Diagnostics: {args.diagnostics}")
     return 0
