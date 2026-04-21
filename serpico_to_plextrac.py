@@ -151,8 +151,13 @@ class Diagnostics:
     candidate_documents: int = 0
     written_findings: int = 0
     written_files: int = 0
+    scanned_files: int = 0
+    parsed_files: int = 0
+    unsupported_files: int = 0
     skipped: list[dict[str, str]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    unsupported_samples: list[str] = field(default_factory=list)
+    unsupported_by_extension: dict[str, int] = field(default_factory=dict)
 
 
 def clean_text(value: Any) -> str:
@@ -383,6 +388,11 @@ def parse_json_bytes(content: bytes, source: str) -> Iterator[SourceRecord]:
         yield from walk_documents(value, source, f"$[{line_no}]")
 
 
+def looks_like_json(content: bytes) -> bool:
+    stripped = content.lstrip()
+    return stripped.startswith((b"{", b"["))
+
+
 def parse_bson_bytes(content: bytes, source: str) -> Iterator[SourceRecord]:
     try:
         from bson import decode_all
@@ -392,8 +402,24 @@ def parse_bson_bytes(content: bytes, source: str) -> Iterator[SourceRecord]:
             f"{source} is BSON. Install optional support with: python -m pip install pymongo"
         ) from exc
 
-    decoded = json.loads(dumps(decode_all(content)))
-    yield from walk_documents(decoded, source)
+    decoded = decode_all(content)
+    if not decoded:
+        raise ValueError("BSON file contained no documents")
+    yield from walk_documents(json.loads(dumps(decoded)), source)
+
+
+def extension_key(path: str) -> str:
+    name = path.split("!", 1)[-1].lower()
+    suffixes = "".join(Path(name).suffixes)
+    return suffixes or "<no extension>"
+
+
+def remember_unsupported(source: str, diagnostics: Diagnostics) -> None:
+    diagnostics.unsupported_files += 1
+    extension = extension_key(source)
+    diagnostics.unsupported_by_extension[extension] = diagnostics.unsupported_by_extension.get(extension, 0) + 1
+    if len(diagnostics.unsupported_samples) < 25:
+        diagnostics.unsupported_samples.append(source)
 
 
 def records_from_file(path: Path, diagnostics: Diagnostics) -> Iterator[SourceRecord]:
@@ -428,15 +454,50 @@ def records_from_file(path: Path, diagnostics: Diagnostics) -> Iterator[SourceRe
 
 def records_from_bytes(content: bytes, source: str, diagnostics: Diagnostics) -> Iterator[SourceRecord]:
     lower = source.lower()
+    diagnostics.scanned_files += 1
     try:
         if lower.endswith((".json", ".jsonl", ".ndjson")):
-            yield from parse_json_bytes(content, source)
+            records = list(parse_json_bytes(content, source))
         elif lower.endswith(".bson"):
-            yield from parse_bson_bytes(content, source)
+            records = list(parse_bson_bytes(content, source))
+        elif looks_like_json(content):
+            records = list(parse_json_bytes(content, source))
         else:
-            diagnostics.warnings.append(f"Skipped unsupported file type: {source}")
+            remember_unsupported(source, diagnostics)
+            return
+        diagnostics.parsed_files += 1
+        yield from records
     except Exception as exc:
         diagnostics.warnings.append(f"Could not parse {source}: {exc}")
+
+
+def inspect_backup(path: Path) -> dict[str, Any]:
+    files: list[Path] = []
+    if path.is_dir():
+        files = sorted(item for item in path.rglob("*") if item.is_file())
+    elif path.is_file():
+        files = [path]
+
+    extensions: dict[str, int] = {}
+    samples: dict[str, list[str]] = {}
+    for file_path in files:
+        key = "".join(file_path.suffixes).lower() or "<no extension>"
+        extensions[key] = extensions.get(key, 0) + 1
+        samples.setdefault(key, [])
+        if len(samples[key]) < 5:
+            samples[key].append(str(file_path))
+
+    return {"root": str(path), "file_count": len(files), "extensions": extensions, "samples": samples}
+
+
+def print_inspection(summary: dict[str, Any]) -> None:
+    print(f"Inspected: {summary['root']}")
+    print(f"Files: {summary['file_count']}")
+    print("Extensions:")
+    for extension, count in sorted(summary["extensions"].items(), key=lambda item: (-item[1], item[0])):
+        print(f"  {extension}: {count}")
+        for sample in summary["samples"][extension]:
+            print(f"    {sample}")
 
 
 def collect_rows(args: argparse.Namespace, diagnostics: Diagnostics) -> list[dict[str, str]]:
@@ -610,6 +671,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("input", type=Path, help="Serpico backup file, archive, or directory.")
     parser.add_argument(
+        "--inspect",
+        action="store_true",
+        help="Summarize backup file extensions and samples, then exit without converting.",
+    )
+    parser.add_argument(
         "-o",
         "--output",
         type=Path,
@@ -667,8 +733,15 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.inspect:
+        print_inspection(inspect_backup(args.input))
+        return 0
+
     diagnostics = convert(args)
 
+    print(f"Scanned files: {diagnostics.scanned_files}")
+    print(f"Parsed files: {diagnostics.parsed_files}")
+    print(f"Unsupported files: {diagnostics.unsupported_files}")
     print(f"Loaded documents: {diagnostics.loaded_documents}")
     print(f"Candidate findings: {diagnostics.candidate_documents}")
     print(f"Wrote findings: {diagnostics.written_findings}")
@@ -677,6 +750,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Skipped or incomplete rows: {len(diagnostics.skipped)}")
     if diagnostics.warnings:
         print(f"Warnings: {len(diagnostics.warnings)}")
+    if diagnostics.unsupported_by_extension:
+        print("Unsupported by extension:")
+        for extension, count in sorted(
+            diagnostics.unsupported_by_extension.items(),
+            key=lambda item: (-item[1], item[0]),
+        )[:10]:
+            print(f"  {extension}: {count}")
+    if diagnostics.unsupported_samples:
+        print("Unsupported samples:")
+        for source in diagnostics.unsupported_samples[:10]:
+            print(f"  {source}")
     if args.output:
         print(f"CSV: {args.output}")
     else:

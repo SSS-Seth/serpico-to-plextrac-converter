@@ -68,6 +68,29 @@ python3 -m pip install pymongo
 python3 serpico_to_plextrac.py /path/to/mongodump --tag Serpico
 ```
 
+## If You See Unsupported File Types
+
+First inspect the backup:
+
+```bash
+python3 serpico_to_plextrac.py /path/to/serpico_backup --inspect
+```
+
+Windows:
+
+```powershell
+python serpico_to_plextrac.py C:\path\to\serpico_backup --inspect
+```
+
+This prints extension counts and sample paths. If the backup contains many
+`.bson` files, install `pymongo`. If it contains mostly attachments, PDFs,
+screenshots, or office files, those are expected to be skipped; the converter
+only imports structured finding/report data.
+
+During conversion, unsupported files are summarized by extension and sample path.
+They are not conversion failures unless the structured report/finding data is in
+one of those unsupported formats.
+
 ## Split options
 
 Default:
