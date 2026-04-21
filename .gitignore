@@ -10,4 +10,7 @@ plextrac_exports/
 conversion_diagnostics.json
 tests/sample_plextrac.csv
 tests/sample_diagnostics.json
+tests/sample_diagnostics_sqlite.json
 tests/sample_exports/
+tests/sample_exports_sqlite/
+tests/sample_serpico.db

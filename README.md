@@ -41,6 +41,8 @@ serpico_id,serpico_source,serpico_path,serpico_report,serpico_client,serpico_own
 - A directory of Serpico export/backup files
 - `.json`, `.jsonl`, and `.ndjson`
 - `.zip`, `.tar`, `.tar.gz`, and `.tgz` archives containing those files
+- SQLite-style Serpico database snapshots such as `.db`, `.sqlite`, `.sqlite3`,
+  `.db.bak`, `.db.serpico.bkp`, and dated `.db.20240430` files
 - `.bson` MongoDB dumps when `pymongo` is installed
 
 Serpico installations vary, so the converter uses conservative field heuristics.
@@ -83,9 +85,11 @@ python serpico_to_plextrac.py C:\path\to\serpico_backup --inspect
 ```
 
 This prints extension counts and sample paths. If the backup contains many
-`.bson` files, install `pymongo`. If it contains mostly attachments, PDFs,
-screenshots, or office files, those are expected to be skipped; the converter
-only imports structured finding/report data.
+`.bson` files, install `pymongo`. If it contains `.db` snapshots, the converter
+will try to parse them as SQLite databases. If it contains mostly attachments,
+PDFs, screenshots, office files, templates, or front-end assets, those are
+expected to be skipped; the converter only imports structured finding/report
+data.
 
 During conversion, unsupported files are summarized by extension and sample path.
 They are not conversion failures unless the structured report/finding data is in

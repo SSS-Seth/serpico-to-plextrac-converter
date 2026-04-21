@@ -13,7 +13,9 @@ import csv
 import html
 import json
 import re
+import sqlite3
 import tarfile
+import tempfile
 import zipfile
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
@@ -131,6 +133,16 @@ FIELD_CANDIDATES = {
         "practice",
     ),
 }
+
+SQLITE_EXTENSIONS = (
+    ".db",
+    ".sqlite",
+    ".sqlite3",
+    ".db.bak",
+    ".db.backup",
+    ".db.serpico.bkp",
+)
+SQLITE_HEADER = b"SQLite format 3\x00"
 
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 CVE_RE = re.compile(r"\bCVE-\d{4}-\d{4,}\b", re.IGNORECASE)
@@ -408,6 +420,89 @@ def parse_bson_bytes(content: bytes, source: str) -> Iterator[SourceRecord]:
     yield from walk_documents(json.loads(dumps(decoded)), source)
 
 
+def looks_like_sqlite(content: bytes) -> bool:
+    return content.startswith(SQLITE_HEADER)
+
+
+def is_sqlite_source(source: str) -> bool:
+    lower = source.lower()
+    if lower.endswith(SQLITE_EXTENSIONS):
+        return True
+    return bool(re.search(r"\.db\.\d{6,}$", lower))
+
+
+def sqlite_value(value: Any) -> Any:
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            return value.hex()
+    return value
+
+
+def sqlite_context_for_row(
+    row: dict[str, Any],
+    report_contexts: dict[str, dict[str, str]],
+) -> dict[str, str]:
+    for key in ("report_id", "reportid", "project_id", "projectid", "assessment_id", "assessmentid"):
+        if key in row and row[key] not in (None, ""):
+            context = report_contexts.get(clean_text(row[key]))
+            if context:
+                return context
+    return {}
+
+
+def parse_sqlite_bytes(content: bytes, source: str) -> Iterator[SourceRecord]:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir) / "serpico.db"
+        temp_path.write_bytes(content)
+        connection = sqlite3.connect(temp_path)
+        connection.row_factory = sqlite3.Row
+        try:
+            table_rows: dict[str, list[dict[str, Any]]] = {}
+            table_names = [
+                row["name"]
+                for row in connection.execute(
+                    "select name from sqlite_master where type = 'table' and name not like 'sqlite_%'"
+                )
+            ]
+
+            for table_name in table_names:
+                rows = []
+                try:
+                    safe_table_name = table_name.replace('"', '""')
+                    cursor = connection.execute(f'select * from "{safe_table_name}"')
+                except sqlite3.DatabaseError:
+                    continue
+                for sql_row in cursor.fetchall():
+                    rows.append({key: sqlite_value(sql_row[key]) for key in sql_row.keys()})
+                table_rows[table_name] = rows
+
+            report_contexts: dict[str, dict[str, str]] = {}
+            for table_name, rows in table_rows.items():
+                if not any(token in table_name.lower() for token in ("report", "project", "assessment")):
+                    continue
+                for row in rows:
+                    context = extract_context(row, {})
+                    if not context:
+                        continue
+                    for key in ("id", "_id", "report_id", "project_id", "assessment_id"):
+                        if key in row and row[key] not in (None, ""):
+                            report_contexts[clean_text(row[key])] = context
+
+            for table_name, rows in table_rows.items():
+                for index, row in enumerate(rows):
+                    context = extract_context(row, sqlite_context_for_row(row, report_contexts))
+                    yield SourceRecord(
+                        source=f"{source}!{table_name}",
+                        path=f"${table_name}[{index}]",
+                        data=row,
+                        context=context,
+                    )
+        finally:
+            connection.close()
+
+
 def extension_key(path: str) -> str:
     name = path.split("!", 1)[-1].lower()
     suffixes = "".join(Path(name).suffixes)
@@ -460,6 +555,8 @@ def records_from_bytes(content: bytes, source: str, diagnostics: Diagnostics) ->
             records = list(parse_json_bytes(content, source))
         elif lower.endswith(".bson"):
             records = list(parse_bson_bytes(content, source))
+        elif is_sqlite_source(source) or looks_like_sqlite(content):
+            records = list(parse_sqlite_bytes(content, source))
         elif looks_like_json(content):
             records = list(parse_json_bytes(content, source))
         else:
