@@ -2,9 +2,12 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+.uv-cache/
+.uv-python/
 plextrac_findings.csv
 plextrac_findings_combined.csv
 plextrac_exports/
 conversion_diagnostics.json
 tests/sample_plextrac.csv
 tests/sample_diagnostics.json
+tests/sample_exports/
